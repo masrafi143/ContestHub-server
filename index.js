@@ -142,7 +142,7 @@ async function run() {
       res.send(result);
     });
 
-    // // Update a user info by ID
+    // Update a user info by ID
     // app.patch("/users/:id", async (req, res) => {
     //   const id = req.params.id;
     //   const updatedUser = req.body;
@@ -158,6 +158,29 @@ async function run() {
     //   const result = await usersCollection.updateOne(query, update);
     //   res.send(result);
     // });
+    app.patch("/users/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { name, image, address } = req.body;
+
+    const query = { _id: new ObjectId(id) };
+
+    const updateFields = {};
+    if (name) updateFields.name = name;
+    if (image) updateFields.image = image;
+    if (address !== undefined) updateFields.address = address;
+
+    const update = { $set: updateFields };
+
+    const result = await usersCollection.updateOne(query, update);
+
+    res.send(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Failed to update profile" });
+  }
+});
+
 
     //delete users
     app.delete("/users/:id", async (req, res) => {
