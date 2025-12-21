@@ -14,7 +14,9 @@ const admin = require("firebase-admin");
 
 // const serviceAccount = require("./contest-hub-firebase-adminsdk.json");
 
-const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8')
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
+  "utf8"
+);
 const serviceAccount = JSON.parse(decoded);
 
 admin.initializeApp({
@@ -36,9 +38,9 @@ const verifyFBToken = async (req, res, next) => {
   const token = req.headers.authorization;
   console.log("headers from middleware, ", req.headers.authorization);
 
-  if (!token) {
-    return res.status(401).send({ message: "unauthorized access" });
-  }
+  // if (!token) {
+  //   return res.status(401).send({ message: "unauthorized access" });
+  // }
 
   try {
     const idToken = token.split(" ")[1];
@@ -73,6 +75,10 @@ async function run() {
     const paymentCollection = db.collection("payments");
     const usersCollection = db.collection("users");
     const creatorsCollection = db.collection("creators");
+    const winnersCollection = db.collection("winners");
+    const statsCollection = db.collection("stats");
+    const leaderboardCollection = db.collection("leaderboard");
+    const taskSubmissionsCollection = db.collection("taskSubmissions");
 
     // middle admin before allowing admin activity
     // must be used after verifyFBToken middleware
@@ -455,7 +461,188 @@ async function run() {
 
       res.send(result);
     });
- 
+
+    // winner related api
+    // Add a winner (admin only)
+    app.post("/winners", verifyFBToken, verifyAdmin, async (req, res) => {
+      const { name, image, prize } = req.body;
+
+      if (!name || !image || !prize) {
+        return res.status(400).send({ message: "All fields are required" });
+      }
+
+      const winner = {
+        name,
+        image,
+        prize: Number(prize),
+        createdAt: new Date(),
+      };
+
+      const result = await winnersCollection.insertOne(winner);
+
+      await statsCollection.updateOne(
+        {},
+        { $inc: { totalWinners: 1, totalPrize: Number(prize) } },
+        { upsert: true }
+      );
+
+      res.send({ success: true, winner: result });
+    });
+
+    // Get recent winners (public)
+    app.get("/winners/recent", async (req, res) => {
+      const winners = await winnersCollection
+        .find()
+        .sort({ createdAt: -1 })
+        .limit(6)
+        .toArray();
+
+      res.send(winners);
+    });
+    // Get winner stats
+    app.get("/stats", async (req, res) => {
+      const stats = await statsCollection.findOne();
+      res.send(stats || { totalWinners: 0, totalPrize: 0 });
+    });
+
+    // leaderboard
+    app.get("/leaderboard", async (req, res) => {
+      try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const skip = (page - 1) * limit;
+
+        const totalCount = await leaderboardCollection.countDocuments();
+
+        const leaders = await leaderboardCollection
+          .find()
+          .sort({ totalWins: -1 }) // highest wins first
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+
+        res.send({
+          data: leaders,
+          currentPage: page,
+          totalPages: Math.ceil(totalCount / limit),
+          totalItems: totalCount,
+        });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: "Failed to load leaderboard" });
+      }
+    });
+
+    // submitted tasks
+// POST /contests/:id/submit-task
+app.post("/contests/:id/submit-task", async (req, res) => {
+  try {
+    const contestId = req.params.id;
+    const { userEmail, taskSubmission } = req.body;
+
+    if (!userEmail || !taskSubmission) {
+      return res.status(400).send({ message: "Email and submission required" });
+    }
+
+    // Fetch contest name
+    const contest = await client
+      .db("contest-hub_db")
+      .collection("contests")
+      .findOne({ _id: new ObjectId(contestId) });
+
+    if (!contest) return res.status(404).send({ message: "Contest not found" });
+
+    // Fetch participant name from users collection
+    const user = await client
+      .db("contest-hub_db")
+      .collection("users")
+      .findOne({ email: userEmail });
+
+    const submission = {
+      contestId: new ObjectId(contestId),
+      contestName: contest.name,
+      participantName: user?.name || "Anonymous",
+      participantEmail: userEmail,
+      submission: taskSubmission,
+      createdAt: new Date(),
+      declaredWinner: false,
+    };
+
+    const result = await client
+      .db("contest-hub_db")
+      .collection("submittedTasks")
+      .insertOne(submission);
+
+    res.send({ success: true, submission: result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ success: false, message: "Failed to submit task" });
+  }
+});
+// GET /submitted-tasks?creatorEmail=...
+app.get("/submitted-tasks", async (req, res) => {
+  try {
+    const creatorEmail = req.query.creatorEmail;
+    if (!creatorEmail) return res.status(400).send({ message: "creatorEmail required" });
+
+    // Get contests of this creator
+    const contests = await client
+      .db("contest-hub_db")
+      .collection("contests")
+      .find({ email: creatorEmail })
+      .toArray();
+
+    const contestIds = contests.map(c => c._id);
+
+    const submissions = await client
+      .db("contest-hub_db")
+      .collection("submittedTasks")
+      .find({ contestId: { $in: contestIds.map(id => new ObjectId(id)) } })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send(submissions);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Failed to fetch submissions" });
+  }
+});
+// PATCH /submitted-tasks/:id/winner
+app.patch("/submitted-tasks/:id/winner", async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const submission = await client
+      .db("contest-hub_db")
+      .collection("submittedTasks")
+      .findOne({ _id: new ObjectId(id) });
+
+    if (!submission) return res.status(404).send({ message: "Submission not found" });
+
+    // check if winner already exists for this contest
+    const winnerExists = await client
+      .db("contest-hub_db")
+      .collection("submittedTasks")
+      .findOne({ contestId: submission.contestId, declaredWinner: true });
+
+    if (winnerExists) {
+      return res.status(400).send({ message: "Winner already declared for this contest" });
+    }
+
+    const result = await client
+      .db("contest-hub_db")
+      .collection("submittedTasks")
+      .updateOne({ _id: new ObjectId(id) }, { $set: { declaredWinner: true } });
+
+    res.send({ success: true, result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Failed to declare winner" });
+  }
+});
+
+
+
     // Send a ping to confirm a successful connection
     // await client.db("admin").command({ ping: 1 });
     // console.log(
